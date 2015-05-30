@@ -463,5 +463,12 @@ namespace Sandbox.Common.ObjectBuilders.Definitions
         // Temporary flag that tells the oxygen system to treat this block as a full block
         [ProtoMember, DefaultValue(false)]
         public bool IsAirTight = false;
+
+        [ProtoMember, DefaultValue(1)]
+        public int BattlePoints = 1;
+
+        [ProtoMember, DefaultValue(0)]
+        public int MaxIntegrity = 0;
+
     }
 }

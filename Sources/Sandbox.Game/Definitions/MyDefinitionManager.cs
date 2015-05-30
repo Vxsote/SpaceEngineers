@@ -217,7 +217,16 @@ namespace Sandbox.Definitions
                 context.CurrentFile = file;
 
                 MyDataIntegrityChecker.HashInFile(file);
-                MyObjectBuilder_Definitions builder = CheckPrefabs(file);
+                MyObjectBuilder_Definitions builder = null;
+                try
+                {
+                    builder = CheckPrefabs(file);
+                }
+                catch (Exception e)
+                {
+                    FailModLoading(context, innerException: e);
+                    return;
+                }
 
                 if (builder == null)
                 {
@@ -226,17 +235,8 @@ namespace Sandbox.Definitions
 
                 if (builder == null)
                 {
-                    MyDefinitionErrors.Add(context, "MOD SKIPPED, Cannot load definition file, see log for details", ErrorSeverity.Critical);
-                    if (context.IsBaseGame)
-                    {
-                        // When original definition fails to load, return to main menu
-                        throw new MyLoadingException(String.Format(MyTexts.GetString(MySpaceTexts.LoadingError_ModifiedOriginalContent), file));
-                    }
-                    else
-                    {
-                        // When definition from MOD fails to load, skip mod loading
-                        return;
-                    }
+                    FailModLoading(context);
+                    return;
                 }
                 definitionsBuilders.Add(new Tuple<MyObjectBuilder_Definitions, string>(builder, file));
             }
@@ -252,20 +252,39 @@ namespace Sandbox.Definitions
 
             for (int i = 0; i < phases.Length; i++)
             {
-                /*try
-                {*/
+                try
+                {
                     foreach (var builder in definitionsBuilders)
                     {
                         context.CurrentFile = builder.Item2;
                         phases[i](builder.Item1, context, definitionSet, failOnDebug);
                     }
-                /*}
-                catch
+                }
+                catch (Exception e)
                 {
-                    MyDefinitionErrors.Add(context, String.Format("MOD PARTIALLY SKIPPED, LOADED ONLY {0}/{1} PHASES, see logfile for details", i + 1, phases.Length), ErrorSeverity.Critical);
+                    FailModLoading(context, phase: i, phaseNum: phases.Length, innerException: e);
                     return;
-                }*/
+                }
                 MergeDefinitions();
+            }
+        }
+
+        private static void FailModLoading(MyModContext context, int phase = -1, int phaseNum = 0, Exception innerException = null)
+        {
+            if (phase == -1)
+                MyDefinitionErrors.Add(context, "MOD SKIPPED, Cannot load definition file, see log for details", ErrorSeverity.Critical);
+            else
+                MyDefinitionErrors.Add(context, String.Format("MOD PARTIALLY SKIPPED, LOADED ONLY {0}/{1} PHASES, see logfile for details", phase + 1, phaseNum), ErrorSeverity.Critical);
+
+            if (context.IsBaseGame)
+            {
+                // When original definition fails to load, return to main menu
+                throw new MyLoadingException(String.Format(MyTexts.GetString(MySpaceTexts.LoadingError_ModifiedOriginalContent), context.CurrentFile), innerException);
+            }
+            else
+            {
+                // When definition from MOD fails to load, skip mod loading
+                return;
             }
         }
 
@@ -576,6 +595,20 @@ namespace Sandbox.Definitions
                 MySandboxGame.Log.WriteLine("Loading character names");
                 InitCharacterNames(context, definitionSet.m_characterNames, objBuilder.CharacterNames, failOnDebug);
             }
+
+            if (objBuilder.Battle != null)
+            {
+                MySandboxGame.Log.WriteLine("Loading battle definition");
+                Check(failOnDebug, "Battle", failOnDebug, WARNING_ON_REDEFINITION_MESSAGE);
+                InitBattle(context, ref definitionSet.m_battleDefinition, objBuilder.Battle, failOnDebug);
+            }
+
+            if (objBuilder.Decals != null)
+            {
+                MySandboxGame.Log.WriteLine("Loading decal definitions");
+                Check(failOnDebug, "Decals", failOnDebug, WARNING_ON_REDEFINITION_MESSAGE);
+                InitDecals(context, objBuilder.Decals, failOnDebug);
+            }
         }
 
         void LoadPhase2(MyObjectBuilder_Definitions objBuilder, MyModContext context, DefinitionSet definitionSet, bool failOnDebug)
@@ -638,6 +671,12 @@ namespace Sandbox.Definitions
                     MySandboxGame.Log.WriteLine("Loading prefabs");
                     InitPrefabs(context, definitionSet.m_prefabs, objBuilder.Prefabs, failOnDebug);
                 }
+            }
+
+            if (MyFakes.ENABLE_GENERATED_INTEGRITY_FIX)
+            {
+                foreach (var size in definitionSet.m_uniqueCubeBlocksBySize)
+                    FixGeneratedBlocksIntegrity(size);
             }
         }
 
@@ -1230,7 +1269,24 @@ namespace Sandbox.Definitions
                 output[res[i].Id] = res[i];
             }
         }
+        private void FixGeneratedBlocksIntegrity(DefinitionDictionary<MyCubeBlockDefinition> cubeBlocks)
+        {
+            foreach(var entry in cubeBlocks)
+            {
+                var block = entry.Value;
+                if (block.GeneratedBlockDefinitions == null) continue;
 
+                foreach(var gen in block.GeneratedBlockDefinitions)
+                {
+                    MyCubeBlockDefinition generatedBlock;
+                    if (!TryGetCubeBlockDefinition(gen, out generatedBlock)) continue;
+                    if (generatedBlock.GeneratedBlockType == MyStringId.GetOrCompute("pillar"))
+                        continue;
+                    generatedBlock.Components = block.Components;
+                    generatedBlock.MaxIntegrity = block.MaxIntegrity;
+                }
+            }
+        }
 
         private static void PrepareBlockBlueprints(MyModContext context,
             Dictionary<MyDefinitionId, MyBlueprintDefinitionBase> output, Dictionary<MyDefinitionId, MyCubeBlockDefinition> cubeBlocks, bool failOnDebug = true)
@@ -1365,6 +1421,26 @@ namespace Sandbox.Definitions
                 Check(!output.ContainsKey(res[i].Id), res[i].Id, failOnDebug);
                 output[res[i].Id] = res[i];
             }
+        }
+
+        private static void InitBattle(MyModContext context,
+            ref MyBattleDefinition output, MyObjectBuilder_BattleDefinition objBuilder, bool failOnDebug = true)
+        {
+            var battleDef = InitDefinition<MyBattleDefinition>(context, objBuilder);
+            output = battleDef;
+        }
+
+        private static void InitDecals(MyModContext context, MyObjectBuilder_DecalDefinition[] objBuilder, bool failOnDebug = true)
+        {
+            List<string> names = new List<string>();
+            List<MyDecalMaterialDesc> desc = new List<MyDecalMaterialDesc>();
+            foreach(var m in objBuilder)
+            {
+                names.Add(m.Id.SubtypeName);
+                desc.Add(m.Material);
+            }
+
+            VRageRender.MyRenderProxy.RegisterDecals(names, desc);
         }
 
         public void SetDefaultNavDef(MyCubeBlockDefinition blockDefinition)
@@ -2441,6 +2517,11 @@ namespace Sandbox.Definitions
         public MyEnvironmentDefinition EnvironmentDefinition
         {
             get { return m_definitions.m_environmentDef; }
+        }
+
+        public MyBattleDefinition BattleDefinition
+        {
+            get { return m_definitions.m_battleDefinition; }
         }
 
         #endregion

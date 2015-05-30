@@ -41,6 +41,7 @@ using Sandbox.Engine.Multiplayer;
 using SteamSDK;
 using Sandbox.Game.SessionComponents;
 using Sandbox.Game.GameSystems;
+using Sandbox.Common.ModAPI;
 
 #endregion
 
@@ -148,12 +149,6 @@ namespace Sandbox.Game.Entities.Character
         const float CHARACTER_Y_ROTATION_SPEED = 0.0026f;
 
         public static float MINIMAL_SPEED = 0.001f;
-
-        public const float CHARACTER_SMALL_DAMAGE = 10;
-        public const float CHARACTER_MEDIUM_DAMAGE = 30;
-        public const float CHARACTER_CRITICAL_DAMAGE = 70;
-        public const float CHARACTER_DEADLY_DAMAGE = 100;
-        public const float CHARACTER_SQUEEZE_DAMAGE_DELAY = 1f;
 
         const float JumpTime = 1; //m/ss
 
@@ -273,7 +268,10 @@ namespace Sandbox.Game.Entities.Character
         MyHudNotification m_pickupObjectNotification;
         MyHudNotification m_showTerminalNotification;
         MyHudNotification m_openInventoryNotification;
-
+        MyHudNotification m_inertiaDampenersNotification;
+        MyHudNotification m_broadcastingNotification;
+        MyHudNotification m_jetpackToggleNotification;
+        
         HkCharacterStateType m_currentCharacterState;
         bool m_isFalling = false;
         bool m_isFallingAnimationPlayed = false;
@@ -445,9 +443,7 @@ namespace Sandbox.Game.Entities.Character
         MyHudNotification m_lowOxygenNotification;
         MyHudNotification m_criticalOxygenNotification;
         MyHudNotification m_oxygenBottleRefillNotification;
-        MyHudNotification m_noHelmetVariationNotification;
-        MyHudNotification m_helmetOnNotification;
-        MyHudNotification m_helmetOffNotification;
+        MyHudNotification m_helmetToggleNotification;
 
         bool m_useAnimationForWeapon = false;
         Matrix m_relativeWeaponMatrix = Matrix.Identity;
@@ -541,6 +537,8 @@ namespace Sandbox.Game.Entities.Character
         public MyRagdollMapper RagdollMapper;
 
         public event EventHandler OnWeaponChanged;
+
+        public event Action<MyCharacter> CharacterDied;
 
         #endregion
 
@@ -644,7 +642,6 @@ namespace Sandbox.Game.Entities.Character
             SyncObject.Tick();
             SyncObject.UpdatePosition();
 
-            //m_inventory = new MyInventory(InventoryVolume * MySession.Static.GameTypeMultiplier, InventorySize, 0, this);
             m_suitBattery = new MyBattery(this);
             m_suitBattery.Init(characterOb.Battery);
 
@@ -671,7 +668,9 @@ namespace Sandbox.Game.Entities.Character
 
             if (!MyDefinitionManager.Static.Characters.TryGetValue(m_characterModel, out m_characterDefinition))
             {
+                //System.Diagnostics.Debug.Fail("Character model " + m_characterModel + " not found!");
                 m_characterDefinition = MyDefinitionManager.Static.Characters.First();
+                m_characterModel = m_characterDefinition.Model;
             }
 
             CharacterHeight = m_characterDefinition.CharacterHeight;
@@ -739,7 +738,7 @@ namespace Sandbox.Game.Entities.Character
 
             m_lightEnabled = characterOb.LightEnabled;
 
-            if (MySession.Static.SimpleSurvival || MySession.Static.Battle)
+			if ((MySession.Static.SurvivalMode && MyPerGameSettings.Game == GameEnum.ME_GAME) || MySession.Static.Battle)
                 m_jetpackEnabled = false;
             else
                 m_jetpackEnabled = m_characterDefinition.JetpackAvailable ? characterOb.JetpackEnabled : false;
@@ -772,6 +771,8 @@ namespace Sandbox.Game.Entities.Character
             MyToolbarComponent.CharacterToolbar.ItemChanged += Toolbar_ItemChanged;
 
             m_breath = new MyCharacterBreath(this);
+            if (m_health!=null)
+                m_breath.SetHealth((float)m_health);
 
             System.Diagnostics.Debug.Assert(Health > 0 && m_currentLootingCounter <= 0 || m_currentLootingCounter > 0);
 
@@ -804,9 +805,10 @@ namespace Sandbox.Game.Entities.Character
             m_oxygenBottleRefillNotification = new MyHudNotification(text: MySpaceTexts.NotificationBottleRefill, level: MyNotificationLevel.Important);
             m_lowOxygenNotification = new MyHudNotification(text: MySpaceTexts.NotificationOxygenLow, font: MyFontEnum.Red, level: MyNotificationLevel.Important);
             m_criticalOxygenNotification = new MyHudNotification(text: MySpaceTexts.NotificationOxygenCritical, font: MyFontEnum.Red, level: MyNotificationLevel.Important);
-            m_noHelmetVariationNotification = new MyHudNotification(text: MySpaceTexts.NotificationNoHelmetVariation, level: MyNotificationLevel.Normal);
-            m_helmetOffNotification = new MyHudNotification(text: MySpaceTexts.NotificationHelmetOff, level: MyNotificationLevel.Normal);
-            m_helmetOnNotification = new MyHudNotification(text: MySpaceTexts.NotificationHelmetOn, level: MyNotificationLevel.Normal);
+            m_broadcastingNotification = new MyHudNotification();
+            m_inertiaDampenersNotification = new MyHudNotification();
+            m_jetpackToggleNotification = new MyHudNotification();
+            m_helmetToggleNotification = new MyHudNotification();
 
             m_needsOxygen = Definition.NeedsOxygen;
 
@@ -859,8 +861,11 @@ namespace Sandbox.Game.Entities.Character
             if (Physics.Ragdoll != null)
             {
                 Physics.CloseRagdollMode();
-                Physics.CloseRagdoll();
-                Physics.Ragdoll = null;
+                Physics.Ragdoll.ResetToRigPose();
+                Physics.Ragdoll.SetToKeyframed();                
+                //Physics.CloseRagdoll();
+                //Physics.Ragdoll = null;
+                return;
             }
 
             Physics.Ragdoll = new HkRagdoll();
@@ -920,7 +925,7 @@ namespace Sandbox.Game.Entities.Character
             if (m_bones.Count == 0) return;
             if (Physics == null || Physics.Ragdoll == null) return;
 
-            RagdollMapper = new MyRagdollMapper(Physics.Ragdoll, m_bones);
+            RagdollMapper = new MyRagdollMapper(this, m_bones);
 
             RagdollMapper.Init(Definition.RagdollBonesMappings);
         }
@@ -1033,6 +1038,8 @@ namespace Sandbox.Game.Entities.Character
             // Are bodies moving one to another? if not we do not apply damage
             if (value.SeparatingVelocity < 0)
             {
+                if (!ControllerInfo.IsLocallyControlled() && !Sync.IsServer) return;
+
                 DamageImpactEnum damageImpact = DamageImpactEnum.NoDamage;
 
                 // Get the colliding object and skip collisions between characters
@@ -1085,7 +1092,7 @@ namespace Sandbox.Game.Entities.Character
 
         private DamageImpactEnum GetDamageFromSqueeze(HkRigidBody collidingBody, MyEntity collidingEntity, ref HkContactPointEvent value)
         {
-            if (collidingBody.IsFixed || collidingBody.Mass < MyPerGameSettings.CharacterDamageObjectMinMass) return DamageImpactEnum.NoDamage;
+            if (collidingBody.IsFixed || collidingBody.Mass < MyPerGameSettings.CharacterSqueezeMinMass) return DamageImpactEnum.NoDamage;
 
             if (value.ContactProperties.IsNew) return DamageImpactEnum.NoDamage;
 
@@ -1104,7 +1111,7 @@ namespace Sandbox.Game.Entities.Character
                 m_squeezeDamageTimer -= MyEngineConstants.UPDATE_STEP_SIZE_IN_SECONDS;
                 return DamageImpactEnum.NoDamage;
             }
-            m_squeezeDamageTimer = CHARACTER_SQUEEZE_DAMAGE_DELAY;
+            m_squeezeDamageTimer = MyPerGameSettings.CharacterSqueezeDamageDelay;
 
             if (MyDebugDrawSettings.ENABLE_DEBUG_DRAW && MyDebugDrawSettings.DEBUG_DRAW_SHOW_DAMAGE)
             {
@@ -1114,26 +1121,28 @@ namespace Sandbox.Game.Entities.Character
                 VRageRender.MyRenderProxy.DebugDrawText3D(worldMatrix.Translation, "SQUEEZE, MASS:" + collidingBody.Mass, Color.Yellow, 2, false);
             }
 
-            if (collidingBody.Mass > 5000) return DamageImpactEnum.DeadlyDamage;
+            if (collidingBody.Mass > MyPerGameSettings.CharacterSqueezeDeadlyDamageMass) return DamageImpactEnum.DeadlyDamage;
 
-            if (collidingBody.Mass > 3000) return DamageImpactEnum.CriticalDamage;
+            if (collidingBody.Mass > MyPerGameSettings.CharacterSqueezeCriticalDamageMass) return DamageImpactEnum.CriticalDamage;
 
-            if (collidingBody.Mass > 1000) return DamageImpactEnum.MediumDamage;
+            if (collidingBody.Mass > MyPerGameSettings.CharacterSqueezeMediumDamageMass) return DamageImpactEnum.MediumDamage;
 
             return DamageImpactEnum.SmallDamage;
         }
 
         private DamageImpactEnum GetDamageFromHit(HkRigidBody collidingBody, MyEntity collidingEntity, ref HkContactPointEvent value)
         {
-            if (Math.Abs(value.SeparatingVelocity) < MyPerGameSettings.CharacterDamageObjectMinVelocity) return DamageImpactEnum.NoDamage;
-            
-            // Get the objects energies to calculate the damage - must be higher above treshold
-            float objectEnergy = collidingBody.LinearVelocity.Length() * collidingBody.Mass;
+            if (collidingBody.LinearVelocity.Length() < MyPerGameSettings.CharacterDamageHitObjectMinVelocity) return DamageImpactEnum.NoDamage;
 
-            if (objectEnergy > 500) return DamageImpactEnum.DeadlyDamage;
-            if (objectEnergy > 200) return DamageImpactEnum.CriticalDamage;
-            if (objectEnergy > 100) return DamageImpactEnum.MediumDamage;
-            if (objectEnergy > 80) return DamageImpactEnum.SmallDamage;
+            if (collidingEntity == ManipulatedEntity) return DamageImpactEnum.NoDamage;
+
+            // Get the objects energies to calculate the damage - must be higher above treshold
+            float objectEnergy = Math.Abs(value.SeparatingVelocity) * (MyPerGameSettings.Destruction ? MyDestructionHelper.MassFromHavok(collidingBody.Mass) : collidingBody.Mass);
+
+            if (objectEnergy > MyPerGameSettings.CharacterDamageHitObjectDeadlyEnergy) return DamageImpactEnum.DeadlyDamage;
+            if (objectEnergy > MyPerGameSettings.CharacterDamageHitObjectCriticalEnergy) return DamageImpactEnum.CriticalDamage;
+            if (objectEnergy > MyPerGameSettings.CharacterDamageHitObjectMediumEnergy) return DamageImpactEnum.MediumDamage;
+            if (objectEnergy > MyPerGameSettings.CharacterDamageHitObjectSmallEnergy) return DamageImpactEnum.SmallDamage;
 
             return DamageImpactEnum.NoDamage;
         }
@@ -1141,7 +1150,7 @@ namespace Sandbox.Game.Entities.Character
         private void ApplyDamage(DamageImpactEnum damageImpact, MyDamageType myDamageType)
         {
             if (!ControllerInfo.IsLocallyControlled() && !Sync.IsServer) return;
-            
+
             if (MyDebugDrawSettings.ENABLE_DEBUG_DRAW && MyDebugDrawSettings.DEBUG_DRAW_SHOW_DAMAGE)
             {
                 if (damageImpact != DamageImpactEnum.NoDamage)
@@ -1153,16 +1162,16 @@ namespace Sandbox.Game.Entities.Character
             switch (damageImpact)
             {
                 case DamageImpactEnum.SmallDamage:
-                    DoDamage(CHARACTER_SMALL_DAMAGE, myDamageType, true);
+                    DoDamage(MyPerGameSettings.CharacterSmallDamage, myDamageType, true);
                     break;
                 case DamageImpactEnum.MediumDamage:
-                    DoDamage(CHARACTER_MEDIUM_DAMAGE, myDamageType, true);
+                    DoDamage(MyPerGameSettings.CharacterMediumDamage, myDamageType, true);
                     break;
                 case DamageImpactEnum.CriticalDamage:
-                    DoDamage(CHARACTER_CRITICAL_DAMAGE, myDamageType, true);
+                    DoDamage(MyPerGameSettings.CharacterCriticalDamage, myDamageType, true);
                     break;
                 case DamageImpactEnum.DeadlyDamage:
-                    DoDamage(CHARACTER_DEADLY_DAMAGE, myDamageType, true);
+                    DoDamage(MyPerGameSettings.CharacterDeadlyDamage, myDamageType, true);
                     break;
                 case DamageImpactEnum.NoDamage:
                 default:
@@ -1173,12 +1182,12 @@ namespace Sandbox.Game.Entities.Character
         private DamageImpactEnum GetDamageFromFall(HkRigidBody collidingBody, MyEntity collidingEntity, ref HkContactPointEvent value)
         {
             //if (m_currentMovementState != MyCharacterMovementEnum.Falling || m_currentMovementState != MyCharacterMovementEnum.Jump) return DamageImpactEnum.NoDamage;
-            
-            if (Physics.LinearVelocity.Length() < MyPerGameSettings.CharacterDamageCharacterMinVelocity) return DamageImpactEnum.NoDamage;
+            if (!collidingBody.IsFixed && collidingBody.Mass < Physics.Mass * 50) return DamageImpactEnum.NoDamage;
+            if (Math.Abs(value.SeparatingVelocity) < MyPerGameSettings.CharacterDamageMinVelocity) return DamageImpactEnum.NoDamage;
 
-            if (Math.Abs(value.SeparatingVelocity) > 16.0f) return DamageImpactEnum.DeadlyDamage;
+            if (Math.Abs(value.SeparatingVelocity) > MyPerGameSettings.CharacterDamageDeadlyDamageVelocity) return DamageImpactEnum.DeadlyDamage;
 
-            if (Math.Abs(value.SeparatingVelocity) > 13.0f) return DamageImpactEnum.MediumDamage;
+            if (Math.Abs(value.SeparatingVelocity) >  MyPerGameSettings.CharacterDamageMediumDamageVelocity) return DamageImpactEnum.MediumDamage;
 
             return DamageImpactEnum.SmallDamage;
         }
@@ -1283,7 +1292,7 @@ namespace Sandbox.Game.Entities.Character
 
             m_soundEmitter.StopSound(true);
 
-            if (MyFakes.ENABLE_CHARACTER_VIRTUAL_PHYSICS)
+            if (MyFakes.ENABLE_CHARACTER_VIRTUAL_PHYSICS && VirtualPhysics != null)
             {
                 VirtualPhysics.Close();
                 VirtualPhysics = null;
@@ -1374,7 +1383,7 @@ namespace Sandbox.Game.Entities.Character
                     DoDamage(1000, MyDamageType.Suicide, true);
             }
 
-            if (MyFakes.ENABLE_CHARACTER_VIRTUAL_PHYSICS)
+            if (MyFakes.ENABLE_CHARACTER_VIRTUAL_PHYSICS && VirtualPhysics != null)
             {
                 if (!VirtualPhysics.IsInWorld && Physics.IsInWorld)
                 {
@@ -1579,6 +1588,11 @@ namespace Sandbox.Game.Entities.Character
             UpdateOxygen();
             if (MyFakes.ENABLE_MISSION_TRIGGERS)
                 UpdateMissionTriggers();
+
+            if (Sync.IsServer && IsDead && MyFakes.ENABLE_RAGDOLL_CLIENT_SYNC)
+            {
+                RagdollMapper.SyncRigidBodiesTransforms(WorldMatrix);
+            }
         }
 
         private void UpdateChat()
@@ -1821,7 +1835,8 @@ namespace Sandbox.Game.Entities.Character
 
         protected void UpdateMissionTriggers()
         {
-            MySessionComponentMission.Static.Update(ControllerInfo.Controller.Player.Id, this);
+            if (ControllerInfo.Controller!=null)
+                MySessionComponentMission.Static.Update(ControllerInfo.Controller.Player.Id, this);
         }
 
         public void DrawHud(IMyCameraController camera, long playerId)
@@ -2013,8 +2028,11 @@ namespace Sandbox.Game.Entities.Character
             VRageRender.MyRenderProxy.GetRenderProfiler().EndProfilingBlock();
 
 
-            VRageRender.MyRenderProxy.GetRenderProfiler().StartProfilingBlock("Dedicated - update transforms");
+            VRageRender.MyRenderProxy.GetRenderProfiler().StartProfilingBlock("Calculate transforms");
             CalculateTransforms();
+            VRageRender.MyRenderProxy.GetRenderProfiler().EndProfilingBlock();
+
+            VRageRender.MyRenderProxy.GetRenderProfiler().StartProfilingBlock("Calculate dependent matrices");
             CalculateDependentMatrices();
             VRageRender.MyRenderProxy.GetRenderProfiler().EndProfilingBlock();
 
@@ -2058,9 +2076,11 @@ namespace Sandbox.Game.Entities.Character
         private void CheckRagdollSwitch()
         {
             if (IsDead) return;
+            if (MySession.ControlledEntity != this) return;
             if (SwitchToJetpackRagdoll && !Physics.IsRagdollModeActive)
             {
                 ActivateJetpackRagdoll();
+                ResetJetpackRagdoll = false;
             }
             else if (!SwitchToJetpackRagdoll && Physics.IsRagdollModeActive)
             {               
@@ -2081,34 +2101,18 @@ namespace Sandbox.Game.Entities.Character
         {
             if (Physics == null || Physics.Ragdoll == null || RagdollMapper == null ) return;
             if (!MyPerGameSettings.EnableRagdollModels) return;
-            if (!RagdollMapper.IsActive || !Physics.Ragdoll.IsAddedToWorld) return;
+            //return;
+            CheckRagdollSwitch();
 
-            Matrix havokWorldMatrix;
-            if (Physics.CharacterProxy != null)
-            {
-                MatrixD characterTransform = Physics.CharacterProxy.GetRigidBodyTransform();
+            if (!RagdollMapper.IsActive || !Physics.IsRagdollModeActive) return;
 
-                Vector3 transformedCenter = Vector3.TransformNormal(Physics.Center, characterTransform);
-                characterTransform.Translation = Physics.CharacterProxy.Position - transformedCenter;                
-                havokWorldMatrix = characterTransform;
-            }
-            else
-            {
-                havokWorldMatrix = Physics.GetWorldMatrix();
-                havokWorldMatrix.Translation = Physics.WorldToCluster(havokWorldMatrix.Translation);
-            }
-
-            RagdollMapper.UpateHavokWorldPosition(havokWorldMatrix);
-            
             if (!RagdollMapper.IsKeyFramed && !RagdollMapper.IsPartiallySimulated) return;
 
+            RagdollMapper.UpateHavokWorldPosition();
             RagdollMapper.UpdateRagdollPose();
-            RagdollMapper.SetLinearVelocity(Physics.LinearVelocity);
-            RagdollMapper.SetAngularVelocity(Physics.AngularVelocity);
-
-
-            RagdollMapper.DebugDraw(WorldMatrix);
+            RagdollMapper.SetVelocities();
             
+            RagdollMapper.DebugDraw(WorldMatrix);            
         }
 
 
@@ -2117,33 +2121,50 @@ namespace Sandbox.Game.Entities.Character
             if (RagdollMapper == null || Physics == null || Physics.Ragdoll == null) return;
             if (!MyPerGameSettings.EnableRagdollModels) return;
             if (!MyPerGameSettings.EnableRagdollInJetpack) return;
-
-            string[] leftHandBones = null;
-            m_characterDefinition.BoneSets.TryGetValue("LeftHand", out leftHandBones);
-
-            string[] rightHandBones = null;
-            m_characterDefinition.BoneSets.TryGetValue("RightHand", out rightHandBones);
-
-           
-            // TODO: MOVE THIS TO DEFINITIONS
+                        
             List<string> bodies = new List<string>();
-                       
+            string[] bodiesArray;                       
+            
             if (CurrentWeapon == null)
             {
-                bodies.Add("Ragdoll_SE_rig_LUpperarm001");
-                bodies.Add("Ragdoll_SE_rig_LForearm001");
-                bodies.Add("Ragdoll_SE_rig_LPalm001");
-                bodies.Add("Ragdoll_SE_rig_RUpperarm001");
-                bodies.Add("Ragdoll_SE_rig_RForearm001");
-                bodies.Add("Ragdoll_SE_rig_RPalm001");
-            }
+                if (m_characterDefinition.RagdollPartialSimulations.TryGetValue("Jetpack", out bodiesArray))
+                {
+                    bodies.AddArray(bodiesArray);
+                }
+                else
+                {
+                    // Fallback if missing definitions
+                    bodies.Add("Ragdoll_SE_rig_LUpperarm001");
+                    bodies.Add("Ragdoll_SE_rig_LForearm001");
+                    bodies.Add("Ragdoll_SE_rig_LPalm001");
+                    bodies.Add("Ragdoll_SE_rig_RUpperarm001");
+                    bodies.Add("Ragdoll_SE_rig_RForearm001");
+                    bodies.Add("Ragdoll_SE_rig_RPalm001");
 
-            bodies.Add("Ragdoll_SE_rig_LThigh001");
-            bodies.Add("Ragdoll_SE_rig_LCalf001");
-            bodies.Add("Ragdoll_SE_rig_LFoot001");
-            bodies.Add("Ragdoll_SE_rig_RThigh001");
-            bodies.Add("Ragdoll_SE_rig_RCalf001");
-            bodies.Add("Ragdoll_SE_rig_RFoot001");
+                    bodies.Add("Ragdoll_SE_rig_LThigh001");
+                    bodies.Add("Ragdoll_SE_rig_LCalf001");
+                    bodies.Add("Ragdoll_SE_rig_LFoot001");
+                    bodies.Add("Ragdoll_SE_rig_RThigh001");
+                    bodies.Add("Ragdoll_SE_rig_RCalf001");
+                    bodies.Add("Ragdoll_SE_rig_RFoot001");
+                }
+            }
+            else
+            {
+                if (m_characterDefinition.RagdollPartialSimulations.TryGetValue("Jetpack_Weapon", out bodiesArray))
+                {
+                    bodies.AddArray(bodiesArray);
+                }
+                else
+                {
+                    bodies.Add("Ragdoll_SE_rig_LThigh001");
+                    bodies.Add("Ragdoll_SE_rig_LCalf001");
+                    bodies.Add("Ragdoll_SE_rig_LFoot001");
+                    bodies.Add("Ragdoll_SE_rig_RThigh001");
+                    bodies.Add("Ragdoll_SE_rig_RCalf001");
+                    bodies.Add("Ragdoll_SE_rig_RFoot001");
+                }
+            }
 
             List<int> simulatedBodies = new List<int>();
 
@@ -2156,18 +2177,7 @@ namespace Sandbox.Game.Entities.Character
 
             if (Physics.IsRagdollModeActive)
             {
-                RagdollMapper.ActivatePartialSimulation(simulatedBodies);
-
-                //TODO: Right now, we don't know how to properly set contraints in order to avoid jerky motion which is cause by collision on bodies in ragdoll
-                // If that is solved this should be removed. Right now, this causes that ragdoll bodies can penetrate each other due to non collision
-                if (!MyFakes.ENABLE_COLLISONS_ON_RAGDOLL)
-                {
-                    Physics.Ragdoll.GenerateRigidBodiesCollisionFilters(MyPhysics.RagdollCollisionLayer, 0, 0);
-                }
-
-                Matrix havokWorldMatrix = WorldMatrix;
-                havokWorldMatrix.Translation = Physics.WorldToCluster(WorldMatrix.Translation);
-                Physics.Ragdoll.SetWorldMatrix(havokWorldMatrix);
+                RagdollMapper.ActivatePartialSimulation(simulatedBodies);                
             }
         }
 
@@ -2191,17 +2201,15 @@ namespace Sandbox.Game.Entities.Character
             if (!MyPerGameSettings.EnableRagdollModels) return;   
             if (Physics == null || RagdollMapper == null) return;
 
-            CheckRagdollSwitch();
-
             if (Physics.Ragdoll == null || !Physics.Ragdoll.IsAddedToWorld || !RagdollMapper.IsActive) return;
-
-            Physics.Ragdoll.UpdateWorldMatrixAfterSimulation();
-
+            
             VRageRender.MyRenderProxy.GetRenderProfiler().StartProfilingBlock("Update Bones To Ragdoll");
+
+            RagdollMapper.UpdateRagdollAfterSimulation();
             
             RagdollMapper.UpdateCharacterPose( IsDead ? 1.0f : 0.1f, IsDead ? 1.0f : 0.0f);
 
-            RagdollMapper.DebugDraw(WorldMatrix);
+            RagdollMapper.DebugDraw(WorldMatrix);            
                         
             VRageRender.MyRenderProxy.GetRenderProfiler().EndProfilingBlock();
 
@@ -2213,7 +2221,7 @@ namespace Sandbox.Game.Entities.Character
                 MyCharacterBone bone = m_bones[i];
                 m_boneRelativeTransforms[i] = bone.ComputeBoneTransform();                
             }
-                       
+
             VRageRender.MyRenderProxy.GetRenderProfiler().EndProfilingBlock();
         }
 
@@ -3418,45 +3426,25 @@ namespace Sandbox.Game.Entities.Character
                 {
                     switch (state)
                     {
-                        case MyCharacterMovementEnum.Walking:
-                        case MyCharacterMovementEnum.Sprinting:
-                        case MyCharacterMovementEnum.Jump:
-                        case MyCharacterMovementEnum.WalkingLeftFront:
-                        case MyCharacterMovementEnum.WalkingRightFront:
-                        case MyCharacterMovementEnum.Running:
-                        case MyCharacterMovementEnum.RunningLeftFront:
-                        case MyCharacterMovementEnum.RunningRightFront:
-                            Physics.CharacterProxy.SetShapeForMove(true);
-                            break;
-
                         case MyCharacterMovementEnum.Crouching:
                             Physics.CharacterProxy.SetShapeForCrouch(Physics.HavokWorld, true);
                             break;
 
-                        case MyCharacterMovementEnum.CrouchWalking:
-                            Physics.CharacterProxy.SetMoveShapeForCrouch(true);
-                            break;
-
-                        case MyCharacterMovementEnum.CrouchWalkingLeftFront:
-                        case MyCharacterMovementEnum.CrouchWalkingRightFront:
-                            Physics.CharacterProxy.SetDiagonalMoveShapeForCrouch(true);
-                            break;
-
-                        case MyCharacterMovementEnum.RotatingLeft:
-                        case MyCharacterMovementEnum.RotatingRight:
-                            Physics.CharacterProxy.SetShapeForMove(false);
-                            break;
-
                         case MyCharacterMovementEnum.CrouchRotatingLeft:
                         case MyCharacterMovementEnum.CrouchRotatingRight:
+                        case MyCharacterMovementEnum.CrouchWalking:
+                        case MyCharacterMovementEnum.CrouchBackWalking:
+                        case MyCharacterMovementEnum.CrouchWalkingLeftBack:
+                        case MyCharacterMovementEnum.CrouchWalkingRightBack:
+                        case MyCharacterMovementEnum.CrouchWalkingLeftFront:
+                        case MyCharacterMovementEnum.CrouchWalkingRightFront:
+                        case MyCharacterMovementEnum.CrouchStrafingLeft:
+                        case MyCharacterMovementEnum.CrouchStrafingRight:
                             Physics.CharacterProxy.SetShapeForCrouch(Physics.HavokWorld, true);
                             break;
 
-                        case MyCharacterMovementEnum.Sitting:
-                            break;
-
                         default:
-                            Physics.CharacterProxy.SetShapeForMove(false);
+                            Physics.CharacterProxy.SetShapeForCrouch(Physics.HavokWorld, false);
                             break;
                     }
                 }
@@ -5311,6 +5299,14 @@ namespace Sandbox.Game.Entities.Character
 
         public void EnableJetpack(bool enable, bool fromLoad = false, bool updateSync = true, bool fromInit = false)
         {
+            if (enable)
+            {
+                SwitchToJetpackRagdoll = true;
+            }
+            else
+            {
+                SwitchToJetpackRagdoll = false;
+            }
             if (m_currentMovementState == MyCharacterMovementEnum.Sitting)
                 return;
 
@@ -5344,11 +5340,10 @@ namespace Sandbox.Game.Entities.Character
 
             if (MySession.ControlledEntity == this && valueChanged)
             {
-                MyStringId text = (noEnergy) ? MySpaceTexts.NotificationJetpackOffNoEnergy
+                m_jetpackToggleNotification.Text = (noEnergy) ? MySpaceTexts.NotificationJetpackOffNoEnergy
                                                      : (canUseJetpack) ? MySpaceTexts.NotificationJetpackOn
                                                                           : MySpaceTexts.NotificationJetpackOff;
-                var notificationUse = new MyHudNotification(text, 2000);
-                MyHud.Notifications.Add(notificationUse);
+                MyHud.Notifications.Add(m_jetpackToggleNotification);
             }
 
             if (Physics.CharacterProxy != null)
@@ -5396,15 +5391,7 @@ namespace Sandbox.Game.Entities.Character
             //            Physics.RigidBody.UpdateMotionType(HkMotionType.Dynamic);
             //        }
             //    }
-            //}
-            if (enable) 
-            {
-                SwitchToJetpackRagdoll = true;
-            }
-            else
-            {
-                SwitchToJetpackRagdoll = false;               
-            }
+            //}           
         }
 
         /// <summary>
@@ -5419,16 +5406,14 @@ namespace Sandbox.Game.Entities.Character
 
                 EnableDampeners(!m_dampenersEnabled, true);
 
-                if (m_dampenersEnabled)
-                    MyHud.Notifications.Add(new MyHudNotification(MySpaceTexts.NotificationInertiaDampenersOn));
-                else
-                    MyHud.Notifications.Add(new MyHudNotification(MySpaceTexts.NotificationInertiaDampenersOff));
+                m_inertiaDampenersNotification.Text = (m_dampenersEnabled ? MySpaceTexts.NotificationInertiaDampenersOn : MySpaceTexts.NotificationInertiaDampenersOff);
+                MyHud.Notifications.Add(m_inertiaDampenersNotification);
             }
         }
 
         public void SwitchThrusts()
         {
-            if (m_currentMovementState != MyCharacterMovementEnum.Died && (!MySession.Static.SimpleSurvival || !MySession.Static.SurvivalMode) && !MySession.Static.Battle)
+            if (m_currentMovementState != MyCharacterMovementEnum.Died && ((!MySession.Static.SimpleSurvival && MyPerGameSettings.Game != GameEnum.ME_GAME) || !MySession.Static.SurvivalMode) && !MySession.Static.Battle)
             {
                 EnableJetpack(!JetpackEnabled);
             }
@@ -5453,10 +5438,8 @@ namespace Sandbox.Game.Entities.Character
             {
                 EnableBroadcasting(!m_radioBroadcaster.WantsToBeEnabled);
 
-                if (m_radioBroadcaster.Enabled)
-                    MyHud.Notifications.Add(new MyHudNotification(MySpaceTexts.NotificationCharacterBroadcastingOn));
-                else
-                    MyHud.Notifications.Add(new MyHudNotification(MySpaceTexts.NotificationCharacterBroadcastingOff));
+                m_broadcastingNotification.Text = (m_radioBroadcaster.Enabled ? MySpaceTexts.NotificationCharacterBroadcastingOn : MySpaceTexts.NotificationCharacterBroadcastingOff);
+                MyHud.Notifications.Add(m_broadcastingNotification);
             }
         }
 
@@ -5588,9 +5571,6 @@ namespace Sandbox.Game.Entities.Character
 
             if (m_currentWeapon != null)
                 m_currentWeapon.OnControlAcquired(this);
-
-            if (MyFakes.ENABLE_MISSION_TRIGGERS)
-                MySessionComponentMission.Static.TryCreateFromDefault(controller.Player.Id, false);
 
             UpdateCharacterPhysics(controller.Player.IsLocalPlayer());
         }
@@ -6077,6 +6057,8 @@ namespace Sandbox.Game.Entities.Character
                     StopUpperAnimation(0.2f);
                     SwitchAnimation(GetCurrentMovementState(), false);
                 }
+
+                ResetJetpackRagdoll = true;
             }
 
             if (m_currentShotTime <= 0)
@@ -6168,6 +6150,8 @@ namespace Sandbox.Game.Entities.Character
 
             Static_CameraAttachedToChanged(null, null);
             MyHud.Crosshair.Show(null);
+
+            ResetJetpackRagdoll = true;
         }
 
         void gunEntity_OnClose(MyEntity obj)
@@ -6451,7 +6435,10 @@ namespace Sandbox.Game.Entities.Character
             m_health -= damage;
 
             if (!IsDead)
+            {
                 PlayDamageSound(oldHealth);
+                m_breath.SetHealth((float)m_health);
+            }
 
             //Allow negative values to be able to remove character at all
             if (IsDead)
@@ -6653,6 +6640,9 @@ namespace Sandbox.Game.Entities.Character
             StartRespawn(RespawnTime);
 
             m_currentLootingCounter = MyPerGameSettings.CharacterDefaultLootingCounter ;
+
+            if (CharacterDied != null)
+                CharacterDied(this);
         }
 
         private void StartRespawn(float respawnTime)
@@ -6736,6 +6726,12 @@ namespace Sandbox.Game.Entities.Character
                 RagdollMapper.SetRagdollToDynamic();
                 RagdollMapper.Activate();
                 //Physics.IsPhantom = true;
+                if (VirtualPhysics != null)
+                {
+                    VirtualPhysics.Enabled = false;
+                    VirtualPhysics.Close();
+                    VirtualPhysics = null;
+                }
             }
 
 
@@ -6888,7 +6884,7 @@ namespace Sandbox.Game.Entities.Character
         /// <summary>
         /// This will just spawn new character, to take control, call respawn on player
         /// </summary>
-        internal static MyCharacter CreateCharacter(MatrixD worldMatrix, Vector3 velocity, string characterName, string model, Vector3? colorMask, bool findNearPos = true, bool AIMode = false, MyCockpit cockpit = null)
+        internal static MyCharacter CreateCharacter(MatrixD worldMatrix, Vector3 velocity, string characterName, string model, Vector3? colorMask, bool findNearPos = true, bool AIMode = false, MyCockpit cockpit = null, bool useInventory = true)
         {
             Vector3D? characterPos = null;
             if (findNearPos)
@@ -6908,7 +6904,7 @@ namespace Sandbox.Game.Entities.Character
                 worldMatrix.Translation = characterPos.Value;
             }
 
-            MyCharacter character = CreateCharacterBase(worldMatrix, ref velocity, characterName, model, colorMask, AIMode);
+            MyCharacter character = CreateCharacterBase(worldMatrix, ref velocity, characterName, model, colorMask, AIMode, useInventory);
 
             if (cockpit == null)
             {
@@ -6938,7 +6934,7 @@ namespace Sandbox.Game.Entities.Character
             return character;
         }
 
-        private static MyCharacter CreateCharacterBase(MatrixD worldMatrix, ref Vector3 velocity, string characterName, string model, Vector3? colorMask, bool AIMode)
+        private static MyCharacter CreateCharacterBase(MatrixD worldMatrix, ref Vector3 velocity, string characterName, string model, Vector3? colorMask, bool AIMode, bool useInventory = true)
         {
             MyCharacter character = new MyCharacter();
             MyObjectBuilder_Character objectBuilder = MyCharacter.Random();
@@ -6955,7 +6951,8 @@ namespace Sandbox.Game.Entities.Character
             objectBuilder.LinearVelocity = velocity;
             objectBuilder.PositionAndOrientation = new MyPositionAndOrientation(worldMatrix);
             character.Init(objectBuilder);
-            MyWorldGenerator.InitInventoryWithDefaults(character.GetInventory());
+            if (useInventory)
+                MyWorldGenerator.InitInventoryWithDefaults(character.GetInventory());
             MyEntities.Add(character);
             //character.PositionComp.SetWorldMatrix(worldMatrix);
             if (velocity.Length() > 0)
@@ -7018,6 +7015,7 @@ namespace Sandbox.Game.Entities.Character
             if (m_health.HasValue)
             {
                 m_health = MathHelper.Clamp(m_health.Value + health, 0, MaxHealth);
+                m_breath.SetHealth((float)m_health);
                 if (m_health.Value == MaxHealth)
                     m_health = null;
             }
@@ -7225,9 +7223,7 @@ namespace Sandbox.Game.Entities.Character
             if (OnWeaponChanged != null)
             {
                 OnWeaponChanged(this, null);               
-            }
-
-            ResetJetpackRagdoll = true;
+            }            
         }
 
         void DoDamageSuccess(float damage, MyDamageType damageType)
@@ -7253,7 +7249,7 @@ namespace Sandbox.Game.Entities.Character
 
             if (sync)
             {
-                SyncObject.PlaySecondarySound((int)cueStringId);
+                SyncObject.PlaySecondarySound(cueStringId);
             }
         }
 
@@ -7987,19 +7983,14 @@ namespace Sandbox.Game.Entities.Character
             {
                 ChangeModelAndColor(Definition.HelmetVariation, this.ColorMask);
                 m_needsOxygen = !Definition.NeedsOxygen;
-                if (Definition.NeedsOxygen)
-                {
-                    MyHud.Notifications.Add(m_helmetOnNotification);
-                }
-                else
-                {
-                    MyHud.Notifications.Add(m_helmetOffNotification);
-                }
+                m_helmetToggleNotification.Text = (Definition.NeedsOxygen ? MySpaceTexts.NotificationHelmetOn : MySpaceTexts.NotificationHelmetOff);
             }
             else
             {
-                MyHud.Notifications.Add(m_noHelmetVariationNotification);
+                m_helmetToggleNotification.Text = MySpaceTexts.NotificationNoHelmetVariation;
             }
+
+            MyHud.Notifications.Add(m_helmetToggleNotification);
         }
 
         void Sandbox.ModAPI.Interfaces.IMyControllableEntity.Die()
@@ -8012,7 +8003,7 @@ namespace Sandbox.Game.Entities.Character
             OnDestroy();
         }
 
-        void IMyDestroyableObject.DoDamage(float damage, MyDamageType damageType, bool sync)
+        void IMyDestroyableObject.DoDamage(float damage, MyDamageType damageType, bool sync, MyHitInfo? hitInfo)
         {
             DoDamage(damage, damageType, sync);
         }
@@ -8212,6 +8203,8 @@ namespace Sandbox.Game.Entities.Character
             return UseObject is T;
         }
 
-        
+
+
+        public MyEntity ManipulatedEntity;
     }
 }

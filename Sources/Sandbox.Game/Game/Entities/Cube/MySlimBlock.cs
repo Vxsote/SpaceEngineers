@@ -22,6 +22,7 @@ using Sandbox.ModAPI.Interfaces;
 using VRage.Library.Utils;
 using Sandbox.Game.GameSystems;
 using Sandbox.Engine.Physics;
+using Sandbox.Common.ModAPI;
 
 namespace Sandbox.Game.Entities.Cube
 {
@@ -204,7 +205,7 @@ namespace Sandbox.Game.Entities.Cube
             }
         }
 
-        internal MyComponentStack ComponentStack
+        public MyComponentStack ComponentStack
         {
             get
             {
@@ -393,6 +394,17 @@ namespace Sandbox.Game.Entities.Cube
                 if (FatBlock != null)
                 {
                     builder.EntityId = FatBlock.EntityId;
+
+                    // Set ownership in battles - actually don't know why "FatBlock.GetObjectBuilderCubeBlock(copy)" is not processed for default MyCubeBlock 
+                    // - see first if "if (FatBlock != null && FatBlock.GetType() != typeof(MyCubeBlock))"
+                    if (MyFakes.ENABLE_BATTLE_SYSTEM && MySession.Static.Battle)
+                    {
+                        if (FatBlock.IDModule != null)
+                        {
+                            builder.Owner = FatBlock.IDModule.Owner;
+                            builder.ShareMode = FatBlock.IDModule.ShareMode;
+                        }
+                    }
                 }
             }
 
@@ -568,7 +580,7 @@ namespace Sandbox.Game.Entities.Cube
             //return Position;
         }
 
-        public void MoveFirstItemToConstructionStockpile(MyInventory fromInventory)
+        public void MoveFirstItemToConstructionStockpile(IMyComponentInventory fromInventory)
         {
             if (MySession.Static.CreativeMode)
             {
@@ -605,9 +617,9 @@ namespace Sandbox.Game.Entities.Cube
             }
         }
 
-        public void MoveItemsToConstructionStockpile(MyInventory fromInventory)
+        public void MoveItemsToConstructionStockpile(IMyComponentInventory fromInventory)
         {
-            if (MySession.Static.CreativeMode)
+            if (MySession.Static.CreativeMode || MySession.Static.SimpleSurvival)
                 return;
 
             m_tmpComponents.Clear();
@@ -638,7 +650,7 @@ namespace Sandbox.Game.Entities.Cube
         /// Moves items with the given flags from the construction inventory to the character.
         /// If the flags are None, all items are moved.
         /// </summary>
-        public void MoveItemsFromConstructionStockpile(MyInventory toInventory, MyItemFlags flags = MyItemFlags.None)
+        public void MoveItemsFromConstructionStockpile(IMyComponentInventory toInventory, MyItemFlags flags = MyItemFlags.None)
         {
             if (m_stockpile == null) return;
 
@@ -663,7 +675,7 @@ namespace Sandbox.Game.Entities.Cube
             m_stockpile.ClearSyncList();
         }
 
-        public void MoveUnneededItemsFromConstructionStockpile(MyInventory toInventory)
+        public void MoveUnneededItemsFromConstructionStockpile(IMyComponentInventory toInventory)
         {
             if (m_stockpile == null) return;
 
@@ -685,7 +697,7 @@ namespace Sandbox.Game.Entities.Cube
             m_stockpile.ClearSyncList();
         }
 
-        public void ClearConstructionStockpile(MyInventory outputInventory)
+        public void ClearConstructionStockpile(IMyComponentInventory outputInventory)
         {
             if (!StockpileEmpty)
             {
@@ -872,26 +884,29 @@ namespace Sandbox.Game.Entities.Cube
             }
         }
 
-        void IMyDestroyableObject.DoDamage(float damage, MyDamageType damageType, bool sync)
+        void IMyDestroyableObject.DoDamage(float damage, MyDamageType damageType, bool sync, MyHitInfo? hitInfo)
         {
             if (sync)
             {
                 Debug.Assert(Sync.IsServer);
                 if (Sync.IsServer)
-                    MySyncHelper.DoDamageSynced(this, damage, damageType);
+                    MySyncHelper.DoDamageSynced(this, damage, damageType, hitInfo);
             }
             else
-                this.DoDamage(damage, damageType);
+                this.DoDamage(damage, damageType, hitInfo: hitInfo);
             return;
         }
 
-        /// <summary>
-        /// Returns true when block is destroyed
-        /// </summary>
-        public void DoDamage(float damage, MyDamageType damageType, bool addDirtyParts = true, MyDestructionHelper.HitInfo? hitInfo = null)
+        public void DoDamage(float damage, MyDamageType damageType, bool addDirtyParts = true, MyHitInfo? hitInfo = null, bool createDecal = true)
         {
             if (!MySession.Static.DestructibleBlocks)
                 return;
+
+            if(FatBlock is MyCompoundCubeBlock) //jn: TODO think of something better
+            {
+                (FatBlock as MyCompoundCubeBlock).DoDamage(damage, damageType, hitInfo);
+                return;
+            }
 
             damage *= DamageRatio; // Low-integrity blocks get more damage
             ProfilerShort.Begin("FatBlock.DoDamage");
@@ -916,7 +931,8 @@ namespace Sandbox.Game.Entities.Cube
                     AccumulatedDamage = 0;
                     var gridPhysics = CubeGrid.Physics;
                     float maxDestructionRadius = CubeGrid.GridSizeEnum == MyCubeSize.Small ? 0.5f : 3;
-                    Sandbox.Engine.Physics.MyDestructionHelper.TriggerDestruction(damage, gridPhysics, hitInfo.Value.Position, hitInfo.Value.Normal, maxDestructionRadius);
+                    if(Sync.IsServer)
+                       Sandbox.Engine.Physics.MyDestructionHelper.TriggerDestruction(damage - m_componentStack.Integrity, gridPhysics, hitInfo.Value.Position, hitInfo.Value.Normal, maxDestructionRadius);
                 }
                 else
                 {
@@ -925,8 +941,14 @@ namespace Sandbox.Game.Entities.Cube
                 CubeGrid.RemoveFromDamageApplication(this);
             }
             else
-                if (MyFakes.SHOW_DAMAGE_EFFECTS && FatBlock != null && BlockDefinition.RationEnoughForDamageEffect((Integrity-damage) / MaxIntegrity))
+            {
+                if (MyFakes.SHOW_DAMAGE_EFFECTS && FatBlock != null && BlockDefinition.RationEnoughForDamageEffect((Integrity - damage) / MaxIntegrity))
                     FatBlock.SetDamageEffect(true);
+
+                if (hitInfo.HasValue && createDecal)
+                    CubeGrid.RenderData.AddDecal(Position, Vector3D.Transform(hitInfo.Value.Position, CubeGrid.PositionComp.WorldMatrixInvScaled),
+                        Vector3D.TransformNormal(hitInfo.Value.Normal, CubeGrid.PositionComp.WorldMatrixInvScaled), BlockDefinition.PhysicalMaterial.DamageDecal);
+            }
 
             return;
         }
