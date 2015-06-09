@@ -900,6 +900,7 @@ namespace Sandbox.Game.Multiplayer
 
         static void OnAllIdentitiesSuccess(ref AllIdentitiesSuccessMsg msg, MyNetworkClient sender)
         {
+            Sync.Players.m_allIdentities.Clear();
             Sync.Players.LoadIdentities(msg.Identities);
         }
 
@@ -1040,7 +1041,7 @@ namespace Sandbox.Game.Multiplayer
                 if (PlayerRemoved != null)
                     PlayerRemoved(player.Id);
 
-                player.CloseRespawnShip();
+                RespawnComponent.AfterRemovePlayer(player);
 
                 var msg = new PlayerRemoveMsg();
                 msg.ClientSteamId = player.Id.SteamId;
@@ -1543,7 +1544,7 @@ namespace Sandbox.Game.Multiplayer
 
             AddPlayer(playerId, newPlayer);
 
-            if (MyFakes.ENABLE_MISSION_TRIGGERS)
+            if (MyFakes.ENABLE_MISSION_TRIGGERS && MySessionComponentMission.Static!=null)
                 MySessionComponentMission.Static.TryCreateFromDefault(playerId);
 
             return newPlayer;

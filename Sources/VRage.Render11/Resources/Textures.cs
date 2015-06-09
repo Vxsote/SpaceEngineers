@@ -136,9 +136,13 @@ namespace VRageRender.Resources
             string path;
             
             if (string.IsNullOrEmpty(contentPath))
+            {
                 path = Path.Combine(MyFileSystem.ContentPath, Textures.Data[texId.Index].Name);
+            }
             else
+            { 
                 path = Path.Combine(contentPath, Textures.Data[texId.Index].Name);
+            }
 
             Debug.Assert(Textures.Data[texId.Index].Resource == null);
             Debug.Assert(GetView(texId) == null, "Texture " + Textures.Data[texId.Index].Name + " in invalid state");
@@ -160,7 +164,8 @@ namespace VRageRender.Resources
                 }
             }
 
-            if (img != null && MathHelper.IsPowerOfTwo(img.Description.Width) && MathHelper.IsPowerOfTwo(img.Description.Height))
+            bool loaded = false;
+            if (img != null)
             {         
                 int skipMipmaps = (Textures.Data[texId.Index].Type != MyTextureEnum.GUI && img.Description.MipLevels > 1) ? MyRender11.RenderSettings.TextureQuality.MipmapsToSkip(img.Description.Width, img.Description.Height) : 0;
 
@@ -193,18 +198,28 @@ namespace VRageRender.Resources
                     OptionFlags = img.Description.Dimension == TextureDimension.TextureCube ? ResourceOptionFlags.TextureCube : ResourceOptionFlags.None
                 };
 
-                var resource = new Texture2D(MyRender11.Device, desc, mipmapsData);
-                Textures.Data[texId.Index].Resource = resource;
-                Textures.Data[texId.Index].Size = new Vector2(targetWidth, targetHeight);
-                Textures.Data[texId.Index].SkippedMipmaps = skipMipmaps;
-                Textures.Data[texId.Index].FileExists = true;
-                Views[texId.Index] = new ShaderResourceView(MyRender11.Device, resource);
-                resource.DebugName = path;
-                Views[texId.Index].DebugName = path;
+                try
+                {
+                    var resource = new Texture2D(MyRender11.Device, desc, mipmapsData);
 
-                img.Dispose();
+                    Textures.Data[texId.Index].Resource = resource;
+                    Textures.Data[texId.Index].Size = new Vector2(targetWidth, targetHeight);
+                    Textures.Data[texId.Index].SkippedMipmaps = skipMipmaps;
+                    Textures.Data[texId.Index].FileExists = true;
+                    Views[texId.Index] = new ShaderResourceView(MyRender11.Device, resource);
+                    resource.DebugName = path;
+                    Views[texId.Index].DebugName = path;
+
+                    img.Dispose();
+
+                    loaded = true;
+                }
+                catch (SharpDXException)
+                {
+                    img.Dispose();
+                }
             }
-            else
+            if(!loaded)
             {
                 // set data to some crap
                 TexId replacingId = ZeroTexId;
@@ -272,6 +287,20 @@ namespace VRageRender.Resources
             }
 
             var nameKey = nameId;
+
+            if(!string.IsNullOrEmpty(contentPath))
+            {
+                var fullPath = Path.Combine(contentPath, nameKey.ToString());
+                if (MyFileSystem.FileExists(fullPath))
+                {
+                    nameKey = X.TEXT(fullPath);
+                }
+                else // take file from main content
+                {
+                    contentPath = null;
+                }
+            }
+
             if (!NameIndex.ContainsKey(nameKey))
             {
                 //Debug.Assert(type != MyTextureEnum.SYSTEM);
@@ -1059,25 +1088,37 @@ namespace VRageRender.Resources
         {
             if(Srvs.ContainsKey(id))
             {
-                Srvs[id].View.Dispose();
+                if (Srvs[id].View != null)
+                {
+                    Srvs[id].View.Dispose();
+                }
                 Srvs.Remove(id);
             }
 
             if (Uavs.ContainsKey(id))
             {
-                Uavs[id].View.Dispose();
+                if (Uavs[id].View != null)
+                {
+                    Uavs[id].View.Dispose();
+                }
                 Uavs.Remove(id);
             }
 
             if (Dsvs.ContainsKey(id))
             {
-                Dsvs[id].View.Dispose();
+                if (Dsvs[id].View != null)
+                {
+                    Dsvs[id].View.Dispose();
+                }
                 Dsvs.Remove(id);
             }
 
             if (Rtvs.ContainsKey(id))
             {
-                Rtvs[id].View.Dispose();
+                if (Rtvs[id].View != null)
+                {
+                    Rtvs[id].View.Dispose();
+                }
                 Rtvs.Remove(id);
             }
 
@@ -1135,8 +1176,11 @@ namespace VRageRender.Resources
                 SubresourceUavs.Remove(k);
             }
 
-            Textures.Data[id.Index].Resource.Dispose();
-            Textures.Data[id.Index].Resource = null;
+            if (Textures.Data[id.Index].Resource != null)
+            {
+                Textures.Data[id.Index].Resource.Dispose();
+                Textures.Data[id.Index].Resource = null;
+            }
 
             Textures.Free(id.Index);
         }
